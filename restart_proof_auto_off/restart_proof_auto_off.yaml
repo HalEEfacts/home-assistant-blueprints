@@ -1,0 +1,228 @@
+blueprint:
+  name: Restart-proof auto-off
+  description: >
+    Turns a device off after a set time, and keeps counting through Home Assistant
+    restarts and updates.
+
+
+    A `delay` or `wait` in an automation is cancelled when Home Assistant restarts,
+    so "turn on, wait 4 hours, turn off" can leave a heater, blanket or pump on
+    all day. This blueprint uses a **timer helper** instead. Timers with
+    "Restore" ticked carry on after a restart, and this automation catches up on
+    anything that ran out while Home Assistant was down.
+
+
+    **What it does**
+
+    - Device turned on any way (app, wall button, voice, another automation)
+      → starts the timer with your default time.
+
+    - Want a different time just once? Start the timer yourself with
+      `timer.start` and a `duration`. If the device is off, it turns on.
+
+    - Timer runs out → turns the device off (up to 3 tries) and writes a
+      logbook line. Optional actions if it still won't turn off.
+
+    - Device turned off early → cancels the timer.
+
+    - Home Assistant starts → after 1 minute, fixes anything that got out of
+      step while it was down.
+
+
+    **Before you use it:** create a Timer helper for this device (Settings →
+    Devices & services → Helpers → Create helper → Timer) and tick
+    **"Restore state and time when Home Assistant starts"**. Without it the
+    timer is lost on restart. One helper and one automation per device.
+  domain: automation
+  author: HalEEfacts
+  source_url: https://github.com/HalEEfacts/home-assistant-blueprints/blob/main/restart_proof_auto_off/restart_proof_auto_off.yaml
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    target_entity:
+      name: Device
+      description: The thing to turn off. Must be a simple on/off entity.
+      selector:
+        entity:
+          filter:
+            - domain:
+                - switch
+                - light
+                - fan
+                - input_boolean
+                - humidifier
+                - siren
+    timer_helper:
+      name: Timer helper
+      description: >
+        A timer helper used only for this device, with "Restore" ticked.
+      selector:
+        entity:
+          filter:
+            - domain: timer
+    default_duration:
+      name: Turn off after
+      description: >
+        Used when the device is turned on by any means. To use a different time
+        once, call `timer.start` on the timer helper with a `duration`.
+      default:
+        hours: 1
+        minutes: 0
+        seconds: 0
+      selector:
+        duration: {}
+    timer_turns_on:
+      name: Starting the timer turns the device on
+      description: >
+        If the device is off and the timer is started (for example from a
+        dashboard button or another automation), turn the device on.
+      default: true
+      selector:
+        boolean: {}
+    startup_turn_off:
+      name: At startup, turn off a device that has no timer running
+      description: >
+        After a restart, a device that is on with no timer running most likely
+        ran out of time while Home Assistant was down, so it is turned off
+        (safest). Untick to start a fresh timer instead (use this if people
+        often turn the device on at the wall while Home Assistant is down).
+      default: true
+      selector:
+        boolean: {}
+    on_failure:
+      name: If it won't turn off (optional)
+      description: >
+        Actions to run when the device is still on after 3 tries, for example a
+        phone notification.
+      default: []
+      selector:
+        action: {}
+
+mode: queued
+max: 10
+
+triggers:
+  - trigger: state
+    entity_id: !input target_entity
+    from: "off"
+    to: "on"
+    id: turned_on
+  - trigger: state
+    entity_id: !input target_entity
+    from: "on"
+    to: "off"
+    id: turned_off
+  - trigger: state
+    entity_id: !input timer_helper
+    from: idle
+    to: active
+    id: timer_started
+  - trigger: event
+    event_type: timer.finished
+    event_data:
+      entity_id: !input timer_helper
+    id: finished
+  - trigger: homeassistant
+    event: start
+    id: ha_start
+
+variables:
+  device: !input target_entity
+  timer_entity: !input timer_helper
+  timer_turns_on: !input timer_turns_on
+  startup_turn_off: !input startup_turn_off
+  device_label: "{{ state_attr(device, 'friendly_name') or device }}"
+
+actions:
+  - if:
+      - condition: trigger
+        id: ha_start
+    then:
+      # Give integrations time to load and restored timers time to resume.
+      - delay:
+          seconds: 60
+      - if:
+          - condition: template
+            value_template: "{{ state_attr(timer_entity, 'restore') != true }}"
+        then:
+          - action: system_log.write
+            data:
+              level: warning
+              logger: blueprints.restart_proof_auto_off
+              message: >
+                {{ timer_entity }} does not have "Restore" ticked, so the
+                auto-off time for {{ device_label }} is lost on every restart.
+                Open the helper's settings and tick it.
+
+  - choose:
+      # 1. Time ran out (now, or while Home Assistant was down): turn off.
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ is_state(device, 'on') and (
+                   trigger.id == 'finished'
+                   or (trigger.id == 'ha_start' and is_state(timer_entity, 'idle') and startup_turn_off)
+                 ) }}
+        sequence:
+          - repeat:
+              sequence:
+                - action: homeassistant.turn_off
+                  target:
+                    entity_id: "{{ device }}"
+                  continue_on_error: true
+                - wait_template: "{{ is_state(device, 'off') }}"
+                  timeout:
+                    seconds: 15
+              until:
+                - condition: template
+                  value_template: "{{ is_state(device, 'off') or repeat.index >= 3 }}"
+          - action: logbook.log
+            data:
+              name: Auto-off
+              entity_id: "{{ device }}"
+              message: >
+                {% if not is_state(device, 'off') %}could not turn off {{ device_label }} after 3 tries
+                {% elif trigger.id == 'finished' %}turned off {{ device_label }}: time ran out
+                {% else %}turned off {{ device_label }}: its time ran out while Home Assistant was down{% endif %}
+          - if:
+              - condition: template
+                value_template: "{{ not is_state(device, 'off') }}"
+            then: !input on_failure
+
+      # 2. Device came on with no timer running: start the default timer.
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ is_state(device, 'on') and is_state(timer_entity, 'idle') and (
+                   trigger.id == 'turned_on'
+                   or (trigger.id == 'ha_start' and not startup_turn_off)
+                 ) }}
+        sequence:
+          - action: timer.start
+            target:
+              entity_id: "{{ timer_entity }}"
+            data:
+              duration: !input default_duration
+
+      # 3. Device is off but a timer is still running: cancel it.
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id in ['turned_off', 'ha_start']
+                 and is_state(device, 'off')
+                 and not is_state(timer_entity, 'idle') }}
+        sequence:
+          - action: timer.cancel
+            target:
+              entity_id: "{{ timer_entity }}"
+
+      # 4. Timer started while the device is off: turn it on.
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'timer_started' and timer_turns_on
+                 and is_state(device, 'off') }}
+        sequence:
+          - action: homeassistant.turn_on
+            target:
+              entity_id: "{{ device }}"
